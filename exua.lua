@@ -185,7 +185,8 @@ wget.callbacks.httploop_result = function(url, err, http_stat)
     downloaded[url["url"]] = true
   end
 
-  if item_type == "gets" and string.match(url["url"], "^https?://[^/]*ex%.ua/get/[0-9]+") then
+  if (item_type == "gets" and string.match(url["url"], "^https?://[^/]*ex%.ua/get/[0-9]+"))
+     or string.match(url["url"], "^https?://[^/]*ex%.ua/[0-9]+%?r=[0-9]+") then
     if status_code == 302 then
       return wget.actions.EXIT
     end

@@ -1,230 +1,305 @@
-dofile("urlcode.lua")
-dofile("table_show.lua")
-JSON = (loadfile "JSON.lua")()
+# encoding=utf8
+import datetime
+from distutils.version import StrictVersion
+import hashlib
+import os.path
+import random
+from seesaw.config import realize, NumberConfigValue
+from seesaw.externalprocess import ExternalProcess
+from seesaw.item import ItemInterpolation, ItemValue
+from seesaw.task import SimpleTask, LimitConcurrent
+from seesaw.tracker import GetItemFromTracker, PrepareStatsForTracker, \
+    UploadWithTracker, SendDoneToTracker
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import string
 
-local item_type = os.getenv('item_type')
-local item_value = os.getenv('item_value')
-local item_dir = os.getenv('item_dir')
-local warc_file_base = os.getenv('warc_file_base')
+import seesaw
+from seesaw.externalprocess import WgetDownload
+from seesaw.pipeline import Pipeline
+from seesaw.project import Project
+from seesaw.util import find_executable
 
-local items = {}
-local disco = {}
 
-local url_count = 0
-local tries = 0
-local downloaded = {}
-local addedtolist = {}
+# check the seesaw version
+if StrictVersion(seesaw.__version__) < StrictVersion("0.8.5"):
+    raise Exception("This pipeline needs seesaw version 0.8.5 or higher.")
 
-for ignore in io.open("ignore-list", "r"):lines() do
-  downloaded[ignore] = true
-end
 
-if item_type == "filelists" or item_type == "gets" or item_type == "files" then
-  start, end_ = string.match(item_value, "([0-9]+)-([0-9]+)")
-  for i=start, end_ do
-    items[i] = true
-  end
-elseif item_type == "user" then
-  items[item_value] = true
-end
+###########################################################################
+# Find a useful Wget+Lua executable.
+#
+# WGET_LUA will be set to the first path that
+# 1. does not crash with --version, and
+# 2. prints the required version string
+WGET_LUA = find_executable(
+    "Wget+Lua",
+    ["GNU Wget 1.14.lua.20130523-9a5c", "GNU Wget 1.14.lua.20160530-955376b"],
+    [
+        "./wget-lua",
+        "./wget-lua-warrior",
+        "./wget-lua-local",
+        "../wget-lua",
+        "../../wget-lua",
+        "/home/warrior/wget-lua",
+        "/usr/bin/wget-lua"
+    ]
+)
 
-read_file = function(file)
-  if file then
-    local f = assert(io.open(file))
-    local data = f:read("*all")
-    f:close()
-    return data
-  else
-    return ""
-  end
-end
+if not WGET_LUA:
+    raise Exception("No usable Wget+Lua found.")
 
-allowed = function(url)
-  if string.match(url, "'+")
-     or string.match(url, "[<>\\]")
-     or string.match(url, "//$") then
-    return false
-  end
 
-  if string.match(url, "^https?://[^/]*ex%.ua/view/[0-9]+$")
-     or string.match(url, "^https?://[^/]*ex%.ua/[0-9]+$") then
-    return false
-  end
+###########################################################################
+# The version number of this pipeline definition.
+#
+# Update this each time you make a non-cosmetic change.
+# It will be added to the WARC files and reported to the tracker.
+VERSION = "20161212.01"
+USER_AGENT = 'ArchiveTeam'
+TRACKER_ID = 'exua'
+TRACKER_HOST = 'tracker.archiveteam.org'
 
-  if (item_type == "filelists" or item_type == "gets" or item_type == "files")
-     and string.match(url, "^https?://[^/]*ex%.ua/") then
-    for s in string.gmatch(url, "([0-9]+)") do
-      if items[tonumber(s)] == true then
-        return true
-      end
-    end
-  end
 
-  return false
-end
+###########################################################################
+# This section defines project-specific tasks.
+#
+# Simple tasks (tasks that do not need any concurrency) are based on the
+# SimpleTask class and have a process(item) method that is called for
+# each item.
+class CheckIP(SimpleTask):
+    def __init__(self):
+        SimpleTask.__init__(self, "CheckIP")
+        self._counter = 0
 
-wget.callbacks.download_child_p = function(urlpos, parent, depth, start_url_parsed, iri, verdict, reason)
-  local url = urlpos["url"]["url"]
-  local html = urlpos["link_expect_html"]
+    def process(self, item):
+        # NEW for 2014! Check if we are behind firewall/proxy
 
-  if (downloaded[url] ~= true and addedtolist[url] ~= true)
-     and (allowed(url) or html == 0) then
-    addedtolist[url] = true
-    return true
-  else
-    return false
-  end
-end
+        if self._counter <= 0:
+            item.log_output('Checking IP address.')
+            ip_set = set()
 
-wget.callbacks.get_urls = function(file, url, is_css, iri)
-  local urls = {}
-  local html = nil
+            ip_set.add(socket.gethostbyname('twitter.com'))
+            ip_set.add(socket.gethostbyname('facebook.com'))
+            ip_set.add(socket.gethostbyname('youtube.com'))
+            ip_set.add(socket.gethostbyname('microsoft.com'))
+            ip_set.add(socket.gethostbyname('icanhas.cheezburger.com'))
+            ip_set.add(socket.gethostbyname('archiveteam.org'))
 
-  downloaded[url] = true
-  
-  local function check(urla)
-    local origurl = url
-    local url = string.match(urla, "^([^#]+)")
-    if string.match(origurl, "^https?://[^/]*ex%.ua/r_view/[0-9]+$") and string.match(url, "^https?://f.+%?") then
-      check(string.match(url, "^(.+)%?"))
-    end
-    if (downloaded[url] ~= true and addedtolist[url] ~= true)
-       and (allowed(url)
-       or (string.match(origurl, "^https?://[^/]*ex%.ua/r_view/[0-9]+$") and string.match(url, "^https?://f"))) then
-      table.insert(urls, { url=string.gsub(url, "&amp;", "&") })
-      addedtolist[url] = true
-      addedtolist[string.gsub(url, "&amp;", "&")] = true
-    end
-  end
+            if len(ip_set) != 6:
+                item.log_output('Got IP addresses: {0}'.format(ip_set))
+                item.log_output(
+                    'Are you behind a firewall/proxy? That is a big no-no!')
+                raise Exception(
+                    'Are you behind a firewall/proxy? That is a big no-no!')
 
-  local function checknewurl(newurl)
-    if string.match(newurl, "^https?:////") then
-      check(string.gsub(newurl, ":////", "://"))
-    elseif string.match(newurl, "^https?://") then
-      check(newurl)
-    elseif string.match(newurl, "^https?:\\/\\?/") then
-      check(string.gsub(newurl, "\\", ""))
-    elseif string.match(newurl, "^\\/\\/") then
-      check(string.match(url, "^(https?:)") .. string.gsub(newurl, "\\", ""))
-    elseif string.match(newurl, "^//") then
-      check(string.match(url, "^(https?:)") .. newurl)
-    elseif string.match(newurl, "^\\/") then
-      check(string.match(url, "^(https?://[^/]+)") .. string.gsub(newurl, "\\", ""))
-    elseif string.match(newurl, "^/") then
-      check(string.match(url, "^(https?://[^/]+)") .. newurl)
-    end
-  end
+        # Check only occasionally
+        if self._counter <= 0:
+            self._counter = 10
+        else:
+            self._counter -= 1
 
-  local function checknewshorturl(newurl)
-    if string.match(newurl, "^%?") then
-      check(string.match(url, "^(https?://[^%?]+)") .. newurl)
-    elseif not (string.match(newurl, "^https?:\\?/\\?//?/?")
-       or string.match(newurl, "^[/\\]")
-       or string.match(newurl, "^[jJ]ava[sS]cript:")
-       or string.match(newurl, "^[mM]ail[tT]o:")
-       or string.match(newurl, "^vine:")
-       or string.match(newurl, "^android%-app:")
-       or string.match(newurl, "^%${")) then
-      check(string.match(url, "^(https?://.+/)") .. newurl)
-    end
-  end
-  
-  if allowed(url) then
-    html = read_file(file)
 
-    if string.match(url, "^https?://[^/]*ex%.ua/r_view/[0-9]+$")
-       and string.match(html, "<author>([^<]+)</author>") then
-      local author = string.match(html, "<author>([^<]+)</author>")
-      local title = string.match(html, "<title>([^<]+)</title>")
-      local object_id = string.match(url, "^https?://[^/]*ex%.ua/r_view/([0-9]+)$")
-      disco[object_id] = {}
-      disco[object_id]["author"] = author
-      disco[object_id]["title"] = title
-      disco[object_id]["files"] = {}
-      for file in string.gmatch(html, "<file%s+([^>]+)/>") do
-        local file_id = string.match(file, 'upload_id="([0-9]+)"')
-        local file_md5 = string.match(file, 'md5="([0-9a-f]+)"')
-        local file_size = string.match(file, 'size="([0-9]+)"')
-        local file_name = string.match(file, 'name="([^"]+)"')
-        disco[object_id]["files"][file_id] = {}
-        disco[object_id]["files"][file_id]["md5"] = file_md5
-        disco[object_id]["files"][file_id]["size"] = file_size
-        disco[object_id]["files"][file_id]["name"] = file_name
-      end
-    end
+class PrepareDirectories(SimpleTask):
+    def __init__(self, warc_prefix):
+        SimpleTask.__init__(self, "PrepareDirectories")
+        self.warc_prefix = warc_prefix
 
-    for newurl in string.gmatch(html, '([^"]+)') do
-      checknewurl(newurl)
-    end
-    for newurl in string.gmatch(html, "([^']+)") do
-      checknewurl(newurl)
-    end
-    for newurl in string.gmatch(html, ">%s*([^<%s]+)") do
-      checknewurl(newurl)
-    end
-    for newurl in string.gmatch(html, "href='([^']+)'") do
-      checknewshorturl(newurl)
-    end
-    for newurl in string.gmatch(html, 'href="([^"]+)"') do
-      checknewshorturl(newurl)
-    end
-  end
+    def process(self, item):
+        item_name = item["item_name"]
+        escaped_item_name = item_name.replace(':', '_').replace('/', '_').replace('~', '_')
+        dirname = "/".join((item["data_dir"], escaped_item_name))
 
-  return urls
-end
-  
+        if os.path.isdir(dirname):
+            shutil.rmtree(dirname)
 
-wget.callbacks.httploop_result = function(url, err, http_stat)
-  status_code = http_stat["statcode"]
-  
-  url_count = url_count + 1
-  io.stdout:write(url_count .. "=" .. status_code .. " " .. url["url"] .. ".  \n")
-  io.stdout:flush()
+        os.makedirs(dirname)
 
-  if (status_code >= 200 and status_code <= 399) then
-    downloaded[url["url"]] = true
-  end
+        item["item_dir"] = dirname
+        item["warc_file_base"] = "%s-%s-%s" % (self.warc_prefix, escaped_item_name,
+            time.strftime("%Y%m%d-%H%M%S"))
 
-  if item_type == "gets" and string.match(url["url"], "^https?://[^/]*ex%.ua/get/[0-9]+") then
-    if status_code == 302 then
-      return wget.actions.EXIT
-    end
-  end
-  
-  if status_code >= 500 or
-    (status_code >= 400 and status_code ~= 404) or
-    status_code == 0 then
-    io.stdout:write("Server returned " .. http_stat.statcode .. " (" .. err .. "). Sleeping.\n")
-    io.stdout:flush()
-    os.execute("sleep 1")
-    tries = tries + 1
-    if tries >= 5 then
-      io.stdout:write("\nI give up...\n")
-      io.stdout:flush()
-      tries = 0
-      if allowed(url["url"]) then
-        return wget.actions.ABORT
-      else
-        return wget.actions.EXIT
-      end
-    else
-      return wget.actions.CONTINUE
-    end
-  end
+        open("%(item_dir)s/%(warc_file_base)s.warc.gz" % item, "w").close()
+        open("%(item_dir)s/%(warc_file_base)s_data.txt" % item, "w").close()
 
-  tries = 0
 
-  local sleep_time = 0
+class MoveFiles(SimpleTask):
+    def __init__(self):
+        SimpleTask.__init__(self, "MoveFiles")
 
-  if sleep_time > 0.001 then
-    os.execute("sleep " .. sleep_time)
-  end
+    def process(self, item):
+        # NEW for 2014! Check if wget was compiled with zlib support
+        if os.path.exists("%(item_dir)s/%(warc_file_base)s.warc" % item):
+            raise Exception('Please compile wget with zlib support!')
 
-  return wget.actions.NOTHING
-end
+        os.rename("%(item_dir)s/%(warc_file_base)s.warc.gz" % item,
+              "%(data_dir)s/%(warc_file_base)s.warc.gz" % item)
+        os.rename("%(item_dir)s/%(warc_file_base)s_data.txt" % item,
+              "%(data_dir)s/%(warc_file_base)s_data.txt" % item)
 
-wget.callbacks.finish = function(start_time, end_time, wall_time, numurls, total_downloaded_bytes, total_download_time)
-  local file = io.open(item_dir .. '/' .. warc_file_base .. '_data.txt', 'w')
-  file:write(JSON:encode(disco))
-  file:close()
-end
+        shutil.rmtree("%(item_dir)s" % item)
+
+
+def get_hash(filename):
+    with open(filename, 'rb') as in_file:
+        return hashlib.sha1(in_file.read()).hexdigest()
+
+
+CWD = os.getcwd()
+PIPELINE_SHA1 = get_hash(os.path.join(CWD, 'pipeline.py'))
+LUA_SHA1 = get_hash(os.path.join(CWD, 'exua.lua'))
+
+
+def stats_id_function(item):
+    # NEW for 2014! Some accountability hashes and stats.
+    d = {
+        'pipeline_hash': PIPELINE_SHA1,
+        'lua_hash': LUA_SHA1,
+        'python_version': sys.version,
+    }
+
+    return d
+
+
+class WgetArgs(object):
+    def realize(self, item):
+        wget_args = [
+            WGET_LUA,
+            "-U", USER_AGENT,
+            "-nv",
+            "--no-cookies",
+            "--lua-script", "exua.lua",
+            "-o", ItemInterpolation("%(item_dir)s/wget.log"),
+            "--no-check-certificate",
+            "--output-document", ItemInterpolation("%(item_dir)s/wget.tmp"),
+            "--truncate-output",
+            "-e", "robots=off",
+            "--rotate-dns",
+            "--recursive", "--level=inf",
+            "--no-parent",
+            "--page-requisites",
+            "--timeout", "30",
+            "--tries", "inf",
+            "--domains", "ex.ua",
+            "--span-hosts",
+            "--waitretry", "30",
+            "--warc-file", ItemInterpolation("%(item_dir)s/%(warc_file_base)s"),
+            "--warc-header", "operator: Archive Team",
+            "--warc-header", "ex-ua-dld-script-version: " + VERSION,
+            "--warc-header", ItemInterpolation("ex-ua-item: %(item_name)s"),
+        ]
+        
+        item_name = item['item_name']
+        assert ':' in item_name
+        item_type, item_value = item_name.split(':', 1)
+        
+        item['item_type'] = item_type
+        item['item_value'] = item_value
+        
+        assert item_type in ('filelists', 'gets', 'files', 'user')
+
+        if item_type == 'filelists':
+            start, stop = item_value.split('-')
+            for i in range(int(start), int(stop)+1):
+                wget_args.extend(['--warc-header', 'ex-ua-filelist: {i}'.format(**locals())])
+                wget_args.append('http://www.ex.ua/filelist/{i}.xspf'.format(**locals()))
+                wget_args.append('http://www.ex.ua/filelist/{i}'.format(**locals()))
+                wget_args.append('http://www.ex.ua/r_view/{i}'.format(**locals()))
+                wget_args.append('http://www.ex.ua/rss/{i}'.format(**locals()))
+                wget_args.append('http://www.ex.ua/rss/{i}?count=100'.format(**locals()))
+        elif item_type == 'gets':
+            start, stop = item_value.split('-')
+            for i in range(int(start), int(stop)+1):
+                wget_args.extend(['--warc-header', 'ex-ua-get: {i}'.format(**locals())])
+                wget_args.extend(['--warc-header', 'ex-ua-torrent: {i}'.format(**locals())])
+                wget_args.append('http://www.ex.ua/get/{i}'.format(**locals()))
+                wget_args.append('http://www.ex.ua/torrent/{i}'.format(**locals()))
+        elif item_type == 'files':
+            start, stop = item_value.split('-')
+            for i in range(int(start), int(stop)+1):
+                wget_args.extend(['--warc-header', 'ex-ua-get: {i}'.format(**locals())])
+                wget_args.extend(['--warc-header', 'ex-ua-torrent: {i}'.format(**locals())])
+                wget_args.extend(['--warc-header', 'ex-ua-file: {i}'.format(**locals())])
+                wget_args.append('http://www.ex.ua/get/{i}'.format(**locals()))
+        elif item_type == 'user':
+            wget_args.extend(['--warc-header', 'ex-ua-user: {item_value}'.format(**locals())])
+            wget_args.append('http://www.ex.ua/get/{i}'.format(**locals()))
+        else:
+            raise Exception('Unknown item')
+        
+        if 'bind_address' in globals():
+            wget_args.extend(['--bind-address', globals()['bind_address']])
+            print('')
+            print('*** Wget will bind address at {0} ***'.format(
+                globals()['bind_address']))
+            print('')
+            
+        return realize(wget_args, item)
+
+###########################################################################
+# Initialize the project.
+#
+# This will be shown in the warrior management panel. The logo should not
+# be too big. The deadline is optional.
+project = Project(
+    title="exua",
+    project_html="""
+        <img class="project-logo" alt="Project logo" src="http://www.archiveteam.org/images/6/6c/Ex.ua_logo.png" height="50px" title=""/>
+        <h2>ex.ua <span class="links"><a href="http://www.ex.ua/">Website</a> &middot; <a href="http://tracker.archiveteam.org/exua/">Leaderboard</a></span></h2>
+        <p>Archiving pages from ex.ua.</p>
+    """
+)
+
+pipeline = Pipeline(
+    CheckIP(),
+    GetItemFromTracker("http://%s/%s" % (TRACKER_HOST, TRACKER_ID), downloader,
+        VERSION),
+    PrepareDirectories(warc_prefix="exua"),
+    WgetDownload(
+        WgetArgs(),
+        max_tries=2,
+        accept_on_exit_code=[0, 4, 8],
+        env={
+            "item_dir": ItemValue("item_dir"),
+            "item_value": ItemValue("item_value"),
+            "item_type": ItemValue("item_type"),
+            "warc_file_base": ItemValue("warc_file_base"),
+        }
+    ),
+    PrepareStatsForTracker(
+        defaults={"downloader": downloader, "version": VERSION},
+        file_groups={
+            "data": [
+                ItemInterpolation("%(item_dir)s/%(warc_file_base)s.warc.gz")
+            ]
+        },
+        id_function=stats_id_function,
+    ),
+    MoveFiles(),
+    LimitConcurrent(NumberConfigValue(min=1, max=4, default="1",
+        name="shared:rsync_threads", title="Rsync threads",
+        description="The maximum number of concurrent uploads."),
+        UploadWithTracker(
+            "http://%s/%s" % (TRACKER_HOST, TRACKER_ID),
+            downloader=downloader,
+            version=VERSION,
+            files=[
+                ItemInterpolation("%(data_dir)s/%(warc_file_base)s.warc.gz"),
+                ItemInterpolation("%(data_dir)s/%(warc_file_base)s_data.txt")
+            ],
+            rsync_target_source_path=ItemInterpolation("%(data_dir)s/"),
+            rsync_extra_args=[
+                "--recursive",
+                "--partial",
+                "--partial-dir", ".rsync-tmp",
+            ]
+            ),
+    ),
+    SendDoneToTracker(
+        tracker_url="http://%s/%s" % (TRACKER_HOST, TRACKER_ID),
+        stats=ItemValue("stats")
+    )
+)
